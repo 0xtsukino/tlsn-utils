@@ -1,12 +1,23 @@
-# `Active::poll` wake-loss minimal repro
+# `Active::poll` wake-loss — residual rate with `fix/mux-deadlock` applied
 
-This branch reproduces an intermittent deadlock in
-`tlsn_mux::connection::active::Active::poll` where the task parks at
-`Registration::poll_read_ready` waiting for inbound bytes and **does not
-wake** when a new `SendFrame` command is queued into its
-`stream_receivers` mpsc channel by a concurrent `Stream::poll_write`. The
-buffered command never reaches the wire; the peer's mux then waits forever
-for bytes that are stranded locally.
+This branch sits on top of [`fix/mux-deadlock`] and adds a diagnostic
+classifier on top of the original reproducer. It demonstrates that the
+fix substantially reduces but does not fully eliminate the wake-loss
+under heavy parallel pressure.
+
+## The bug, briefly
+
+`tlsn_mux::connection::active::Active::poll` parks at
+`Registration::poll_read_ready` while one or more `Stream::poll_write`
+calls have queued `SendFrame` commands into `stream_receivers` that
+`Active` never gets re-scheduled to drain. Buffered commands never reach
+the wire; the peer's mux waits forever for bytes that are stranded
+locally.
+
+The dump-stack signature (both sides parked at `poll_read_ready`) looks
+identical to a *stress-induced timeout* where the runtime is just slow
+under heavy CPU oversubscription. The two are indistinguishable from the
+dump alone — which is what the classifier added in this branch is for.
 
 ## Reproduce
 
@@ -15,71 +26,92 @@ cargo test --no-run -p test-harness --test wake_loss_repro
 bash mux/test-harness/scripts/repro_wake_loss.sh
 ```
 
-The script defaults to **N = 4 × nproc** parallel processes (i.e. ~4× CPU
-oversubscription). On a 16-core x86_64 Linux host this means N = 64.
-Observed on such a host:
+The script defaults to **N = 4 × nproc** parallel processes. On a 16-core
+host that's N = 64. Each attempt has a 60 s in-test watchdog (using
+`std::thread::sleep`, not `tokio::time::sleep` — so it fires reliably
+even if the tokio runtime is starved) plus a 120 s outer `timeout`
+backstop.
 
-| N | Hang rate |
+When the in-test watchdog fires it reads a `Handle::diag_snapshot()`
+from both connection drivers (atomic-only, no tokio runtime needed) and
+prints one of these classifications:
+
+| Classification | What it means |
 |---|---|
-| 16 (≈ 1× cores) | 0 / 16 |
-| 32 (≈ 2× cores) | 0 / 32 |
-| 48 (≈ 3× cores) | 15 / 48 (~31%) |
-| 64 (≈ 4× cores) | 61 / 64 (~95%) |
+| `STRESS_FALSE_POSITIVE` | `Active::poll` polled `< 5 s` ago — the runtime is alive, the workload just didn't fit the 60 s budget under load. Not a bug. |
+| `WAKE_LOSS_WRITE` | `Active::poll` idle `> 30 s` AND some stream has `outbound_pending > 0` — frames were pushed to the mpsc channel but `Active` was never re-scheduled to drain them. **The bug.** |
+| `WAKE_LOSS_READ` | `Active::poll` idle `> 30 s` AND some stream has bytes buffered but unread. Read-side wake-loss. |
+| `PROTOCOL_DEADLOCK` | `Active::poll` idle `> 30 s`, no work pending anywhere. Both sides genuinely waiting for the other to do something next. |
+| `CPU_STARVED` | Watchdog `std::thread::sleep(60 s)` returned far late (`> 65 s`). Dump unreliable. |
 
-So the test reliably hangs at ≥ 4× cores' worth of parallelism. Below 2× it
-typically passes. Pass `N` explicitly if your host has a different core
-count:
+## Observed rates on this branch (16-core x86_64 Linux, `fix/mux-deadlock` applied)
+
+Aggregated over 10 batches × N=128 = **1280 attempts**:
+
+| Outcome | Count | Rate |
+|---|---|---|
+| Healthy completion | 49 | 3.8 % |
+| `STRESS_FALSE_POSITIVE` (workload too big for 60 s budget) | 962 | 75.2 % |
+| **`WAKE_LOSS_WRITE`** (real bug recurrence) | **23** | **1.8 %** |
+| `UNK` (reaped by outer timeout before watchdog completed) | 246 | 19.2 % |
+
+So **the fix knocks the wake-loss rate down massively (vs pre-fix
+~80-90 % at N=128) but ≈1.8 % of attempts still hit the bug.** The 1.8 %
+is a lower bound — some of the 246 UNK attempts may have been real
+wake-losses too but the runtime was so starved the watchdog itself
+couldn't finish dumping in time.
+
+A representative real `WAKE_LOSS_WRITE` dump:
 
 ```
-bash mux/test-harness/scripts/repro_wake_loss.sh 64
+=== HANG WATCHDOG FIRED after expected=60s, actual_wall=60.031s ===
+  handle[0]: idle_ms=49465 polls=182255 popped=63533 sent=0 dispatched=0
+             streams=190 outbound_pending=120 inbound_bytes=0
+    sid=073ea566308f84e6 outbound_pending=11 inbound_bytes=0
+                        reader_waker=true writer_waker=false
+    sid=0c26e91f68c4531f outbound_pending=11 inbound_bytes=0
+                        reader_waker=true writer_waker=false
+    ...
+  handle[1]: idle_ms=49579 polls=170567 popped=53929 sent=0 dispatched=0
+             streams=190 outbound_pending=467 inbound_bytes=0
+    ...
+=== CLASSIFICATION: WAKE_LOSS_WRITE — Active is idle but stream has unprocessed outbound commands ===
+    max_outbound_pending=11 max_inbound_bytes=0 min_idle_ms=49465 starved=false
 ```
 
-Per-attempt logs land in a fresh `/tmp/wake-loss-repro.XXXXXX` directory
-(printed by the script). Each hang contains a tokio task dump captured by
-the in-test 60 s watchdog; look for two poll-loops parked at
-`tokio::runtime::io::registration::Registration::poll_read_ready`.
-
-Each per-attempt log contains a tokio task dump captured by the in-test
-60 s watchdog; look for two poll-loops parked at
-`tokio::runtime::io::registration::Registration::poll_read_ready`.
-
-## What the repro does
-
-`wake_loss_repro` pairs two `Connection`s over loopback TCP via
-`test_harness::connected_peers`, opens 256 streams with deterministic
-per-stream varied workloads (payload size 256 B .. 64 KiB, 1 .. 30 rounds,
-0 .. 200 ms start delays, 0 .. 20 ms between-round delays, four send/recv
-flavours: ping-pong, write-first, small-chunks, bursty), plus 2 CPU-hog
-tasks that busy-spin / `yield_now` in a loop to create scheduler contention.
-
-Single-process the test passes. **Under 16-process parallel pressure
-the bug reproduces in ~100% of attempts within ~75 s.** The parallel
-pressure is what we believe is required to expose the wake-up race; the
-script supplies it.
-
-## What the task dump shows
-
-Two `Connection::poll` / `Active::poll` tasks parked deep at
-`Registration::poll_read_ready` — i.e. each side is waiting for the
-**other** side's mux to send more bytes. The receiver-side
-`stream_receivers.poll_next_unpin(cx)` has returned `Pending` (its waker is
-registered). Concurrently, `Stream::poll_write` has done
-`self.sender.start_send(cmd)` returning `Ok(())` — the `SendFrame`
-command is sitting in the mpsc channel — but `Active::poll` is never
-rescheduled to consume it.
-
-The sender is `futures::channel::mpsc::Sender<StreamCommand>`. The
-receiver wrapper is
-`SelectAll<TaggedStream<StreamId, mpsc::Receiver<StreamCommand>>>` polled
-inside `Active::poll`. The wake-up from `start_send` to this `SelectAll`
-appears to be lost under contention.
+Side 0 has 120 frames stranded across 25 streams; side 1 has 467 across
+33; both `Active::poll`s have been idle for ~49 s while frames sit in
+their `stream_receivers` channels. `reader_waker=true` on stranded
+streams means consumers are parked waiting for inbound bytes that the
+*other* side wants to send but its `Active` never wakes to drain its
+own outbound queue.
 
 ## Platform / version
 
-* Linux x86_64 only (`tokio::runtime::Handle::dump` requirement).
-* tlsn-mux at this branch's commit (no patches in the mux source itself —
-  the `64722f7` baseline = current `dev` HEAD for `mux/` reproduces this
-  unchanged).
-* Cargo: requires `tokio_unstable` cfg (set in `.cargo/config.toml` at
-  the workspace root) and tokio `taskdump` / `tracing` features (set in
-  `mux/test-harness/Cargo.toml`).
+* Linux x86_64 only (`tokio::runtime::Handle::dump` is used in the
+  classifier-free fallback path — though our `std::thread`-based
+  watchdog itself doesn't require it).
+* Sits on top of `fix/mux-deadlock` (`1c814df`).
+* Cargo: `tokio_unstable` cfg (in `.cargo/config.toml`) + tokio
+  `taskdump` / `tracing` features (in `mux/test-harness/Cargo.toml`).
+
+## Diagnostic instrumentation
+
+The classifier relies on lightweight atomic counters added to
+`mux/mux/src/connection/{stream.rs,active.rs}` and exposed via
+`Handle::diag_snapshot()`:
+
+* `Shared::outbound_pending: AtomicI64` — incremented in
+  `Stream::poll_write` (and `send_window_update`) after a successful
+  `start_send`, decremented in `Active::poll` when popping a
+  `SendFrame` from the `stream_receivers` channel.
+* `Diag::last_poll_at_ms: AtomicI64` — updated at the top of every
+  `Active::poll` loop iteration.
+* `Handle::diag_snapshot()` — atomic loads only; safe to call from a
+  non-tokio `std::thread` watchdog even when the tokio runtime is
+  starved.
+
+All instrumentation is observation-only; no behavioural changes to the
+fix or to the mux protocol.
+
+[`fix/mux-deadlock`]: ../../../../tree/fix/mux-deadlock
