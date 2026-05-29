@@ -26,11 +26,27 @@ cargo test --no-run -p test-harness --test wake_loss_repro
 bash mux/test-harness/scripts/repro_wake_loss.sh
 ```
 
-The script defaults to **N = 4 × nproc** parallel processes. On a 16-core
-host that's N = 64. Each attempt has a 60 s in-test watchdog (using
-`std::thread::sleep`, not `tokio::time::sleep` — so it fires reliably
-even if the tokio runtime is starved) plus a 120 s outer `timeout`
-backstop.
+The script defaults to **10 batches × N = 4 × nproc** parallel attempts
+(so 1280 attempts on a 16-core host). **Plan for ~30 minutes wall clock.**
+
+Why so many: with the fix applied the wake-loss is fleeting — only
+~1-2 % of attempts trigger it even under 4× CPU oversubscription. A
+single batch of N attempts will often produce zero real wake-loss
+observations. 10 batches gives ≈20 observations on average — enough to
+confirm the bug still manifests without being statistical noise.
+
+Override the defaults if your host is smaller or you want a quicker
+smoke test:
+
+```
+bash mux/test-harness/scripts/repro_wake_loss.sh <BATCHES> <N>
+# e.g.   ... 1 32     for a ~2-minute smoke test (1 batch × 32 attempts)
+# e.g.   ... 10 128   to match the rate table below exactly
+```
+
+Each attempt has a 60 s in-test watchdog (using `std::thread::sleep`,
+not `tokio::time::sleep` — so it fires reliably even if the tokio
+runtime is starved) plus a 120 s outer `timeout` backstop.
 
 When the in-test watchdog fires it reads a `Handle::diag_snapshot()`
 from both connection drivers (atomic-only, no tokio runtime needed) and
