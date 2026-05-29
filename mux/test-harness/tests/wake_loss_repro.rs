@@ -24,7 +24,7 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use futures::io::{AsyncReadExt, AsyncWriteExt};
 use test_harness::connected_peers;
-use tlsn_mux::{Config, Connection, Stream};
+use tlsn_mux::{Config, Connection, Handle, Snapshot, Stream};
 use tokio::net::TcpStream;
 use tokio_util::compat::Compat;
 
@@ -163,29 +163,112 @@ async fn run_profile(mut stream: Stream, profile: Profile) -> Result<()> {
     Ok(())
 }
 
-fn spawn_hang_watchdog(timeout: Duration) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        tokio::time::sleep(timeout).await;
-        let handle = tokio::runtime::Handle::current();
-        let dump = handle.dump().await;
-        eprintln!("=== HANG WATCHDOG FIRED after {timeout:?} — tokio task dump ===");
-        for (i, task) in dump.tasks().iter().enumerate() {
-            eprintln!("--- task #{i} id={} ---", task.id());
-            eprintln!("{}", task.trace());
+/// Watchdog that fires after `timeout` wall-clock seconds **regardless of
+/// tokio runtime state** (uses a `std::thread`, not `tokio::time::sleep`).
+/// Reads the diagnostic snapshots from each `Handle` (atomic-only, no
+/// runtime needed), classifies the hang, and exits.
+fn spawn_hang_watchdog(handles: Vec<Handle>, timeout: Duration) -> std::sync::mpsc::Sender<()> {
+    let (tx, rx) = std::sync::mpsc::channel::<()>();
+    let started = Instant::now();
+    std::thread::spawn(move || {
+        if rx.recv_timeout(timeout).is_ok() {
+            return; // cancelled by Drop / explicit call — test finished cleanly
         }
-        eprintln!("=== END TASK DUMP ===");
-        eprintln!("watchdog: hang detected after {timeout:?}");
+
+        let actual = started.elapsed();
+        eprintln!(
+            "=== HANG WATCHDOG FIRED after expected={:?}, actual_wall={:.3?} ===",
+            timeout, actual
+        );
+
+        // Atomic-only snapshots — work even if tokio is starved.
+        let snaps: Vec<Snapshot> = handles.iter().map(|h| h.diag_snapshot()).collect();
+
+        for (i, snap) in snaps.iter().enumerate() {
+            let total_outbound: usize = snap.streams.iter().map(|s| s.outbound_pending).sum();
+            let total_inbound: usize = snap.streams.iter().map(|s| s.inbound_buffer_bytes).sum();
+            eprintln!(
+                "  handle[{i}]: idle_ms={} polls={} popped={} sent={} dispatched={} streams={} outbound_pending={} inbound_bytes={}",
+                snap.idle_ms,
+                snap.poll_iterations,
+                snap.frames_popped,
+                snap.frames_sent,
+                snap.frames_dispatched,
+                snap.streams.len(),
+                total_outbound,
+                total_inbound,
+            );
+            for s in &snap.streams {
+                if s.outbound_pending > 0 || s.inbound_buffer_bytes > 0 {
+                    eprintln!(
+                        "    sid={} outbound_pending={} inbound_bytes={} reader_waker={} writer_waker={}",
+                        s.stream_id,
+                        s.outbound_pending,
+                        s.inbound_buffer_bytes,
+                        s.has_reader_waker,
+                        s.has_writer_waker,
+                    );
+                }
+            }
+        }
+
+        let actual_ms = actual.as_millis() as i64;
+        let expected_ms = timeout.as_millis() as i64;
+        let starved = actual_ms > expected_ms + 5_000; // 5s slack
+
+        let max_outbound = snaps
+            .iter()
+            .flat_map(|s| s.streams.iter())
+            .map(|s| s.outbound_pending)
+            .max()
+            .unwrap_or(0);
+        let max_inbound = snaps
+            .iter()
+            .flat_map(|s| s.streams.iter())
+            .map(|s| s.inbound_buffer_bytes)
+            .max()
+            .unwrap_or(0);
+        let min_idle_ms = snaps.iter().map(|s| s.idle_ms).min().unwrap_or(0);
+
+        let classification = if starved {
+            "CPU_STARVED — watchdog fired late; dump unreliable"
+        } else if max_outbound > 0 && min_idle_ms > 30_000 {
+            "WAKE_LOSS_WRITE — Active is idle but stream has unprocessed outbound commands"
+        } else if max_inbound > 0 && min_idle_ms > 30_000 {
+            "WAKE_LOSS_READ — Stream has inbound bytes but no progress for 30+ s"
+        } else if max_outbound == 0 && max_inbound == 0 && min_idle_ms > 30_000 {
+            "PROTOCOL_DEADLOCK — both sides idle, nothing in flight, mutual wait"
+        } else if min_idle_ms < 5_000 {
+            "STRESS_FALSE_POSITIVE — Active was active very recently"
+        } else {
+            "UNCLASSIFIED — see counters above"
+        };
+        eprintln!("=== CLASSIFICATION: {classification} ===");
+        eprintln!(
+            "    max_outbound_pending={} max_inbound_bytes={} min_idle_ms={} starved={}",
+            max_outbound, max_inbound, min_idle_ms, starved
+        );
+        eprintln!("watchdog: hang detected after expected {timeout:?}");
         std::process::exit(1);
-    })
+    });
+    tx
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn wake_loss_repro() -> Result<()> {
-    let watchdog = spawn_hang_watchdog(Duration::from_secs(WATCHDOG_SECS));
     let deadline = Instant::now() + Duration::from_secs(TEST_BUDGET_SECS);
 
     let (mut server_conn, mut client_conn) =
         connected_peers(Config::default(), Config::default(), None).await?;
+
+    // Grab handles BEFORE consuming the Connections in spawn_poll_driver.
+    // The std::thread watchdog reads them via Handle::diag_snapshot.
+    let server_handle = server_conn.handle()?;
+    let client_handle = client_conn.handle()?;
+    let watchdog_cancel = spawn_hang_watchdog(
+        vec![server_handle, client_handle],
+        Duration::from_secs(WATCHDOG_SECS),
+    );
 
     let mut server_streams = Vec::with_capacity(STREAMS);
     let mut client_streams = Vec::with_capacity(STREAMS);
@@ -218,6 +301,7 @@ async fn wake_loss_repro() -> Result<()> {
     }
     server_driver.abort();
     client_driver.abort();
-    watchdog.abort();
+    // Cancel the watchdog so its std::thread exits without firing.
+    let _ = watchdog_cancel.send(());
     Ok(())
 }

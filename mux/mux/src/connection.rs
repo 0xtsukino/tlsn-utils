@@ -17,6 +17,7 @@
 mod active;
 mod cleanup;
 mod closing;
+pub mod diag;
 mod rtt;
 mod stream;
 mod user_id;

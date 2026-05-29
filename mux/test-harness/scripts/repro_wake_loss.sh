@@ -30,7 +30,7 @@ for i in $(seq 1 "$N"); do
         # Spawn cargo test in the background so this subshell can watch
         # the log file and announce outcomes the instant they're written —
         # rather than waiting for the child to fully exit.
-        timeout --kill-after=10 90 stdbuf -oL -eL \
+        timeout --kill-after=10 120 stdbuf -oL -eL \
             cargo test -p test-harness --test wake_loss_repro -- --nocapture \
             > "$out" 2>&1 &
         cargo_pid=$!

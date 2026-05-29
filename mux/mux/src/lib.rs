@@ -32,7 +32,10 @@ pub(crate) mod connection;
 mod tagged_stream;
 
 pub use crate::{
-    connection::{Connection, Handle, Stream},
+    connection::{
+        Connection, Handle, Stream,
+        diag::{Snapshot, StreamDiag},
+    },
     error::ConnectionError,
     frame::{
         FrameDecodeError,

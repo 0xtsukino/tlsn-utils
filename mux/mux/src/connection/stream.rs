@@ -200,6 +200,13 @@ impl Stream {
         self.sender
             .start_send(cmd)
             .map_err(|_| self.write_zero_err())?;
+        // Diagnostic: window-update SendFrames also go through Active::poll's
+        // decrement path, so we must increment here too — otherwise the
+        // counter underflows.
+        self.shared
+            .lock()
+            .outbound_pending
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.driver_waker.wake();
 
         Poll::Ready(Ok(()))
@@ -303,6 +310,12 @@ impl AsyncWrite for Stream {
         self.sender
             .start_send(cmd)
             .map_err(|_| self.write_zero_err())?;
+        // Diagnostic: track that a SendFrame is now in the mpsc channel
+        // awaiting consumption by Active::poll. Decremented when popped.
+        self.shared
+            .lock()
+            .outbound_pending
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.driver_waker.wake();
         Poll::Ready(Ok(n))
     }
@@ -351,6 +364,14 @@ pub(crate) struct Shared {
     pub(crate) buffer: Chunks,
     pub(crate) reader: Option<Waker>,
     pub(crate) writer: Option<Waker>,
+    /// Diagnostic: outbound StreamCommands pushed by Stream::poll_write minus
+    /// commands popped by Active::poll for this stream. Non-zero at watchdog
+    /// time means data is stranded in the local mpsc channel — wake-loss
+    /// (write-side).
+    /// Signed: brief Relaxed-ordering races between push (fetch_add in
+    /// poll_write) and pop (fetch_sub in Active::poll) can briefly go
+    /// negative without wrapping to usize::MAX.
+    pub(crate) outbound_pending: std::sync::atomic::AtomicI64,
 }
 
 impl Shared {
@@ -374,6 +395,7 @@ impl Shared {
             buffer: Chunks::new(),
             reader: None,
             writer: None,
+            outbound_pending: std::sync::atomic::AtomicI64::new(0),
         }
     }
 

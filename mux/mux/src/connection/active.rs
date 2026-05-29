@@ -28,6 +28,7 @@ use super::{
     Id, UserId,
     cleanup::Cleanup,
     closing::Closing,
+    diag::{Diag, Snapshot, StreamDiag},
     rtt,
     stream::{self, State, Stream},
 };
@@ -159,6 +160,7 @@ impl StreamRegistry {
 #[derive(Clone)]
 pub struct Handle {
     registry: Arc<Mutex<StreamRegistry>>,
+    diag: Arc<Diag>,
 }
 
 impl Handle {
@@ -167,6 +169,42 @@ impl Handle {
     /// The stream ID is computed from the user ID using BLAKE3.
     pub fn new_stream(&self, user_id: &[u8]) -> Result<Stream> {
         self.registry.lock().new_stream(user_id)
+    }
+
+    /// Snapshot the connection driver's diagnostic counters and per-stream
+    /// queue depths. All atomic loads — safe to call from a non-tokio
+    /// thread (e.g. a `std::thread`-based watchdog) even when the tokio
+    /// runtime is starved.
+    pub fn diag_snapshot(&self) -> Snapshot {
+        let now_ms = self.diag.now_ms();
+        let last = self.diag.last_poll_at_ms.load(std::sync::atomic::Ordering::Relaxed);
+        let registry = self.registry.lock();
+        let streams: Vec<StreamDiag> = registry
+            .streams
+            .iter()
+            .map(|(sid, shared_arc)| {
+                let shared = shared_arc.lock();
+                StreamDiag {
+                    stream_id: *sid,
+                    outbound_pending: shared
+                        .outbound_pending
+                        .load(std::sync::atomic::Ordering::Relaxed)
+                        .max(0) as usize,
+                    inbound_buffer_bytes: shared.buffer.len(),
+                    has_reader_waker: shared.reader.is_some(),
+                    has_writer_waker: shared.writer.is_some(),
+                }
+            })
+            .collect();
+        Snapshot {
+            now_ms,
+            idle_ms: now_ms - last,
+            poll_iterations: self.diag.poll_iterations.load(std::sync::atomic::Ordering::Relaxed),
+            frames_popped: self.diag.frames_popped.load(std::sync::atomic::Ordering::Relaxed),
+            frames_sent: self.diag.frames_sent.load(std::sync::atomic::Ordering::Relaxed),
+            frames_dispatched: self.diag.frames_dispatched.load(std::sync::atomic::Ordering::Relaxed),
+            streams,
+        }
     }
 }
 
@@ -202,6 +240,7 @@ pub(crate) struct Active<T> {
     no_streams_waker: Option<Waker>,
 
     driver_waker: Arc<AtomicWaker>,
+    diag: Arc<Diag>,
 
     pending_read_frame: Option<Frame<()>>,
     pending_write_frame: Option<Frame<()>>,
@@ -246,6 +285,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Active<T> {
             new_receiver_tx,
             driver_waker.clone(),
         )));
+        let diag = Arc::new(Diag::new());
         Active {
             id,
             config,
@@ -255,6 +295,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Active<T> {
             new_receiver_rx,
             no_streams_waker: None,
             driver_waker,
+            diag,
             pending_read_frame: None,
             pending_write_frame: None,
         }
@@ -264,6 +305,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Active<T> {
     pub(super) fn handle(&self) -> Handle {
         Handle {
             registry: self.registry.clone(),
+            diag: self.diag.clone(),
         }
     }
 
@@ -310,6 +352,8 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Active<T> {
 
     pub(super) fn poll(&mut self, cx: &mut Context<'_>) -> Poll<Result<()>> {
         loop {
+            self.diag.record_poll();
+
             // Poll for new stream receivers from Handle
             while let Poll::Ready(Some(receiver)) = self.new_receiver_rx.poll_next_unpin(cx) {
                 self.stream_receivers.push(receiver);
@@ -350,6 +394,19 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Active<T> {
                             frame.header().stream_id(),
                             frame.header()
                         );
+                        // Diagnostic: this frame was popped from the local
+                        // mpsc channel, so the stream's outbound_pending
+                        // counter goes down.
+                        let sid = frame.header().stream_id();
+                        if let Some(shared) = self.registry.lock().streams.get(&sid).cloned() {
+                            shared
+                                .lock()
+                                .outbound_pending
+                                .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                        }
+                        self.diag
+                            .frames_popped
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         self.pending_write_frame.replace(frame);
                         continue;
                     }
